@@ -1,0 +1,34 @@
+# Local credentials and tokens — never commit
+*.pem
+*.key
+*.token
+.env
+.env.*
+!.env.example
+kubeconfig*
+*openrc.sh
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Test scratch
+pytest-cache-files-*/
+pytest-temp-*/
+
+# Local artifacts that don't belong in the repo
+/tmp/
+*.bak
+*.bak-*

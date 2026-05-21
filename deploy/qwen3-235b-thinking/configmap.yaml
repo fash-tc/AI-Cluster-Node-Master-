@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen3-235b-thinking-config
+  namespace: lab-domains-sre
+data:
+  MODEL_ID: Qwen/Qwen3-235B-A22B-Thinking-2507-FP8
+  SERVED_MODEL_NAME: qwen3-235b-thinking
+  MAX_MODEL_LEN: "65536"
+  MAX_NUM_SEQS: "2"
+  MAX_NUM_BATCHED_TOKENS: "8192"
+  CPU_OFFLOAD_GB: "144"

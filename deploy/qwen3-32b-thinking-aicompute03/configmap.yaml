@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen3-32b-thinking-aicompute03-config
+  namespace: lab-domains-sre
+data:
+  MODEL_ID: Qwen/Qwen3-32B-FP8
+  SERVED_MODEL_NAME: qwen3-32b-thinking
+  MAX_MODEL_LEN: "32768"
+  MAX_NUM_SEQS: "16"
+  MAX_NUM_BATCHED_TOKENS: "32768"

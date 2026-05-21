@@ -1,0 +1,251 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wiki-ingester-code
+  namespace: lab-domains-sre
+data:
+  ingest.py: |
+    """
+    Confluence -> rag-search ingester.
+
+    Lists all pages in a Confluence space via REST API v2, converts storage
+    XHTML to plain text, chunks by heading + paragraph, and upserts each
+    chunk into a rag-search collection.
+
+    Designed to run as a K8s Job (initial bulk fill) or a CronJob (daily
+    re-sync). Upserts are idempotent by (page_id * 1000 + chunk_index), so
+    re-running just refreshes content for pages whose markup changed.
+    """
+    import json
+    import os
+    import re
+    import sys
+    import base64
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    import html2text
+
+    # Required configuration
+    CONFLUENCE_SITE = os.environ["CONFLUENCE_SITE"].rstrip("/")  # e.g. https://wiki-tucows.atlassian.net
+    SPACE_KEY = os.environ["SPACE_KEY"]                          # e.g. OCC
+    ATLASSIAN_EMAIL = os.environ["ATLASSIAN_EMAIL"]
+    ATLASSIAN_API_TOKEN = os.environ["ATLASSIAN_API_TOKEN"]
+
+    # rag-search target
+    RAG_BASE = os.environ.get(
+        "RAG_BASE",
+        "http://domains-rag-search.lab-domains-sre.svc.cluster.local:8081",
+    ).rstrip("/")
+    COLLECTION = os.environ.get("COLLECTION", "occ_wiki")
+
+    # Chunking
+    CHUNK_TARGET_CHARS = int(os.environ.get("CHUNK_TARGET_CHARS", "2200"))
+    CHUNK_MIN_CHARS = int(os.environ.get("CHUNK_MIN_CHARS", "300"))
+
+    AUTH_HEADER = "Basic " + base64.b64encode(
+        f"{ATLASSIAN_EMAIL}:{ATLASSIAN_API_TOKEN}".encode()
+    ).decode()
+
+    _h2t = html2text.HTML2Text()
+    _h2t.body_width = 0
+    _h2t.ignore_images = True
+    _h2t.ignore_emphasis = False
+    _h2t.ignore_links = False
+    _h2t.skip_internal_links = True
+
+
+    def conf_get(path, params=None):
+        url = f"{CONFLUENCE_SITE}{path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": AUTH_HEADER, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+
+    def get_space_id(key):
+        resp = conf_get("/wiki/api/v2/spaces", {"keys": key, "limit": 5})
+        results = resp.get("results", []) or []
+        for s in results:
+            if s.get("key") == key:
+                return s["id"]
+        raise RuntimeError(f"space {key!r} not found")
+
+
+    def iter_pages(space_id):
+        """Yield page dicts (with body.storage.value) from a space, paginated."""
+        cursor = None
+        while True:
+            params = {"limit": 50, "body-format": "storage", "status": "current"}
+            if cursor:
+                params["cursor"] = cursor
+            resp = conf_get(f"/wiki/api/v2/spaces/{space_id}/pages", params)
+            results = resp.get("results", []) or []
+            for page in results:
+                yield page
+            next_link = (resp.get("_links") or {}).get("next")
+            if not next_link:
+                break
+            # next is path+query, extract cursor parameter
+            parsed = urllib.parse.urlparse(next_link)
+            q = urllib.parse.parse_qs(parsed.query)
+            cursor = (q.get("cursor") or [None])[0]
+            if not cursor:
+                break
+
+
+    def xhtml_to_text(xhtml):
+        # Confluence storage format includes <ac:*> macros, <ri:*> resource
+        # references, and custom inline elements. Strip the most common
+        # noise before letting html2text do the heavy lifting.
+        if not xhtml:
+            return ""
+        cleaned = re.sub(r"<ac:image[\s\S]*?</ac:image>", "", xhtml)
+        cleaned = re.sub(r"<ri:[^/>]+/>", "", cleaned)
+        cleaned = re.sub(r"<ac:emoticon[^/]*/>", "", cleaned)
+        cleaned = re.sub(r"<ac:placeholder[\s\S]*?</ac:placeholder>", "", cleaned)
+        # collapse remaining ac: tags but keep the inner text
+        cleaned = re.sub(r"<ac:[^>]+>", "", cleaned)
+        cleaned = re.sub(r"</ac:[^>]+>", "", cleaned)
+        text = _h2t.handle(cleaned)
+        # collapse 3+ blank lines
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+    def chunk_markdown(body, target_chars=CHUNK_TARGET_CHARS, min_chars=CHUNK_MIN_CHARS):
+        sections = []
+        current_heading = ""
+        buf = []
+        for line in body.splitlines():
+            if re.match(r"^#{1,6}\s", line):
+                if buf:
+                    sections.append((current_heading, "\n".join(buf).strip()))
+                    buf = []
+                current_heading = line.lstrip("#").strip()
+                buf.append(line)
+            else:
+                buf.append(line)
+        if buf:
+            sections.append((current_heading, "\n".join(buf).strip()))
+
+        chunks = []
+        for heading, content in sections:
+            if not content.strip():
+                continue
+            if len(content) <= target_chars:
+                chunks.append((heading, content))
+                continue
+            paragraphs = re.split(r"\n\s*\n", content)
+            current = ""
+            for para in paragraphs:
+                if not para.strip():
+                    continue
+                if current and len(current) + len(para) + 2 > target_chars:
+                    chunks.append((heading, current.strip()))
+                    current = para
+                else:
+                    current = (current + "\n\n" + para) if current else para
+            if current.strip():
+                chunks.append((heading, current.strip()))
+
+        merged = []
+        for heading, content in chunks:
+            if merged and len(content) < min_chars and len(merged[-1][1]) + len(content) < target_chars * 1.3:
+                prev_heading, prev_content = merged[-1]
+                merged[-1] = (prev_heading, prev_content + "\n\n" + content)
+            else:
+                merged.append((heading, content))
+        return merged
+
+
+    def rag_init(collection):
+        req = urllib.request.Request(
+            f"{RAG_BASE}/v1/collections/{collection}/init",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+
+
+    def rag_upsert_batch(collection, items):
+        body = json.dumps({"items": items}).encode()
+        req = urllib.request.Request(
+            f"{RAG_BASE}/v1/collections/{collection}/upsert_batch",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return json.loads(resp.read().decode())
+
+
+    def main():
+        print(f"site={CONFLUENCE_SITE} space={SPACE_KEY} collection={COLLECTION} rag={RAG_BASE}", flush=True)
+        rag_init(COLLECTION)
+        space_id = get_space_id(SPACE_KEY)
+        print(f"space_id={space_id}", flush=True)
+
+        total_pages = 0
+        total_chunks = 0
+        failures = []
+        for page in iter_pages(space_id):
+            page_id = int(page["id"])
+            title = page.get("title") or ""
+            updated = ((page.get("version") or {}).get("createdAt")) or ""
+            body_obj = (page.get("body") or {}).get("storage") or {}
+            xhtml = body_obj.get("value") or ""
+            text = xhtml_to_text(xhtml)
+            if not text.strip():
+                print(f"  skip empty: {page_id} {title!r}", flush=True)
+                continue
+            chunks = chunk_markdown(text)
+            if not chunks:
+                print(f"  skip no-chunks: {page_id} {title!r}", flush=True)
+                continue
+
+            url = f"{CONFLUENCE_SITE}/wiki/spaces/{SPACE_KEY}/pages/{page_id}"
+            items = []
+            for idx, (heading, content) in enumerate(chunks):
+                snippet = f"{title}\n{heading}\n\n{content}".strip() if heading else f"{title}\n\n{content}".strip()
+                items.append({
+                    "id": page_id * 1000 + idx,
+                    "text": snippet,
+                    "metadata": {
+                        "page_id": str(page_id),
+                        "page_title": title,
+                        "page_url": url,
+                        "chunk_index": idx,
+                        "chunk_heading": heading,
+                        "source": "confluence",
+                        "space_key": SPACE_KEY,
+                        "updated_at": updated,
+                    },
+                })
+
+            try:
+                for i in range(0, len(items), 25):
+                    rag_upsert_batch(COLLECTION, items[i:i + 25])
+                print(f"  ok: {page_id} {title!r} -> {len(items)} chunks", flush=True)
+                total_pages += 1
+                total_chunks += len(items)
+            except (urllib.error.HTTPError, urllib.error.URLError, Exception) as exc:
+                print(f"  FAIL: {page_id} {title!r}: {exc}", flush=True)
+                failures.append((page_id, title, str(exc)))
+
+        print(f"\ndone: pages={total_pages} chunks={total_chunks} failures={len(failures)}", flush=True)
+        if failures:
+            for pid, title, err in failures[:10]:
+                print(f"  - {pid} {title!r}: {err}", flush=True)
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()

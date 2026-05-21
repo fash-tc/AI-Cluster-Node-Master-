@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-shim
+  namespace: lab-domains-sre
+spec:
+  replicas: 0
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: ollama-shim
+  template:
+    metadata:
+      labels:
+        app: ollama-shim
+    spec:
+      containers:
+        - name: shim
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -u
+            - /app/shim.py
+          ports:
+            - containerPort: 11434
+              name: ollama
+          env:
+            - name: GATEWAY_BASE
+              value: http://domains-llm-gateway.lab-domains-sre.svc.cluster.local:4000
+            - name: EMBEDDINGS_BASE
+              value: http://domains-embeddings.lab-domains-sre.svc.cluster.local:11434
+            - name: LISTEN_PORT
+              value: "11434"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "1"
+              memory: "256Mi"
+          volumeMounts:
+            - name: code
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: code
+          configMap:
+            name: ollama-shim-code

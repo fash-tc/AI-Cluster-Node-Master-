@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-235b-thinking
+  namespace: lab-domains-sre
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: qwen3-235b-thinking
+  template:
+    metadata:
+      labels:
+        app: qwen3-235b-thinking
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: aicompute01.cnco1.tucows.cloud
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - |
+              set -euo pipefail
+              exec vllm serve "${MODEL_ID}" \
+                --served-model-name "${SERVED_MODEL_NAME}" \
+                --host 0.0.0.0 \
+                --port 8000 \
+                --trust-remote-code \
+                --enable-expert-parallel \
+                --kv-cache-dtype fp8 \
+                --cpu-offload-gb "${CPU_OFFLOAD_GB}" \
+                --max-model-len "${MAX_MODEL_LEN}" \
+                --max-num-seqs "${MAX_NUM_SEQS}" \
+                --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
+                --reasoning-parser deepseek_r1 \
+                --enable-auto-tool-choice \
+                --tool-call-parser hermes \
+                --disable-uvicorn-access-log
+          ports:
+            - containerPort: 8000
+              name: openai
+          envFrom:
+            - configMapRef:
+                name: qwen3-235b-thinking-config
+          env:
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: SAFETENSORS_FAST_GPU
+              value: "1"
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: "7200"
+            - name: VLLM_LOG_STATS_INTERVAL
+              value: "10"
+          resources:
+            requests:
+              cpu: "32"
+              memory: "260Gi"
+              nvidia.com/gpu: 4
+            limits:
+              cpu: "64"
+              memory: "400Gi"
+              nvidia.com/gpu: 4
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            - name: dshm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            failureThreshold: 240
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 600
+            periodSeconds: 30
+            failureThreshold: 6
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: qwen3-235b-thinking-cache
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

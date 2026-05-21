@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: embeddings-ollama
+  namespace: lab-domains-sre
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: embeddings-ollama
+  template:
+    metadata:
+      labels:
+        app: embeddings-ollama
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              set -e
+              ollama serve &
+              server_pid=$!
+              until ollama list >/dev/null 2>&1; do
+                sleep 2
+              done
+              ollama pull bge-m3
+              wait "$server_pid"
+          ports:
+            - containerPort: 11434
+              name: ollama
+          env:
+            - name: OLLAMA_HOST
+              value: 0.0.0.0:11434
+            - name: OLLAMA_KEEP_ALIVE
+              value: "-1"
+            - name: OLLAMA_NUM_PARALLEL
+              value: "8"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+          volumeMounts:
+            - name: ollama-data
+              mountPath: /root/.ollama
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - ollama list | grep -q '^bge-m3'
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 40
+            periodSeconds: 20
+      volumes:
+        - name: ollama-data
+          persistentVolumeClaim:
+            claimName: embeddings-ollama-data

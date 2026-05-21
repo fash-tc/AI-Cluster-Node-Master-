@@ -1,0 +1,284 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-search-code
+  namespace: lab-domains-sre
+data:
+  rag.py: |
+    """
+    rag-search - Generic embeddings + pgvector retrieval service.
+
+    REST API. One collection per consumer; collections are isolated tables
+    in the shared pgvector PostgreSQL instance.
+
+    Endpoints:
+      POST /v1/collections/{name}/init    - idempotent table + HNSW index create
+      POST /v1/collections/{name}/upsert  - {id, text, metadata?} -> embed + write
+      POST /v1/collections/{name}/upsert_batch - {items: [{id, text, metadata?}, ...]}
+      POST /v1/collections/{name}/search  - {query, top_k?, filter?} -> top matches
+      POST /v1/collections/{name}/delete  - {ids: [int, ...]}
+      GET  /v1/collections/{name}/count   - row count
+      GET  /                              - liveness
+    """
+    import json
+    import os
+    import re
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    PG_DSN = os.environ.get(
+        "PG_DSN",
+        "postgresql://rag:CHANGE_ME_BEFORE_APPLY@domains-pgvector.lab-domains-sre.svc.cluster.local:5432/rag",
+    )
+    EMBED_URL = os.environ.get(
+        "EMBED_URL",
+        "http://domains-embeddings.lab-domains-sre.svc.cluster.local:11434/api/embed",
+    )
+    EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
+    VECTOR_DIM = int(os.environ.get("VECTOR_DIM", "1024"))
+    LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8081"))
+
+    _COLLECTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,49}$")
+    _COLLECTION_PATH_RE = re.compile(r"^/v1/collections/([a-z][a-z0-9_]{0,49})/([a-z_]+)$")
+    _COLLECTION_GET_RE = re.compile(r"^/v1/collections/([a-z][a-z0-9_]{0,49})/(count)$")
+
+    def _table(name):
+        if not _COLLECTION_RE.match(name):
+            raise ValueError(f"invalid collection name: {name!r}")
+        return f"rag_{name}"
+
+    def _ensure_extension():
+        with psycopg.connect(PG_DSN) as conn, conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.commit()
+
+    def _embed(text):
+        body = json.dumps({"model": EMBED_MODEL, "input": text}).encode("utf-8")
+        req = urllib.request.Request(
+            EMBED_URL,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        embeddings = data.get("embeddings") or []
+        if not embeddings:
+            raise RuntimeError(f"embedder returned no embeddings: {data}")
+        vec = embeddings[0]
+        if len(vec) != VECTOR_DIM:
+            raise RuntimeError(
+                f"embedder returned {len(vec)} dims, expected {VECTOR_DIM} — "
+                "set VECTOR_DIM env var to match the model"
+            )
+        return vec
+
+    def _vec_literal(vec):
+        return "[" + ",".join(format(float(x), ".7g") for x in vec) + "]"
+
+    def init_collection(name):
+        table = _table(name)
+        with psycopg.connect(PG_DSN) as conn, conn.cursor() as cur:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table} (
+                    id BIGINT PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    metadata JSONB DEFAULT '{{}}'::jsonb,
+                    embedding vector({VECTOR_DIM}),
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS {table}_embedding_idx
+                ON {table} USING hnsw (embedding vector_cosine_ops)
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS {table}_metadata_idx
+                ON {table} USING gin (metadata)
+            """)
+            conn.commit()
+
+    def upsert(name, item):
+        table = _table(name)
+        item_id = int(item["id"])
+        text = str(item["text"])
+        metadata = item.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("metadata must be an object")
+        vec = _embed(text)
+        with psycopg.connect(PG_DSN) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""INSERT INTO {table} (id, text, metadata, embedding, updated_at)
+                    VALUES (%s, %s, %s, %s::vector, NOW())
+                    ON CONFLICT (id) DO UPDATE SET
+                      text = EXCLUDED.text,
+                      metadata = EXCLUDED.metadata,
+                      embedding = EXCLUDED.embedding,
+                      updated_at = NOW()""",
+                (item_id, text, Jsonb(metadata), _vec_literal(vec)),
+            )
+            conn.commit()
+        return {"id": item_id, "status": "ok"}
+
+    def search(name, body):
+        table = _table(name)
+        query = str(body.get("query") or "")
+        if not query.strip():
+            raise ValueError("query is required")
+        top_k = min(int(body.get("top_k") or 10), 100)
+        filter_obj = body.get("filter") or None
+        if filter_obj is not None and not isinstance(filter_obj, dict):
+            raise ValueError("filter must be an object")
+        vec = _embed(query)
+        vec_lit = _vec_literal(vec)
+        params = [vec_lit]
+        where = ""
+        if filter_obj:
+            where = "WHERE metadata @> %s"
+            params.append(Jsonb(filter_obj))
+        params.append(vec_lit)
+        params.append(top_k)
+        sql = (
+            f"SELECT id, text, metadata, 1 - (embedding <=> %s::vector) AS score "
+            f"FROM {table} {where} "
+            f"ORDER BY embedding <=> %s::vector "
+            f"LIMIT %s"
+        )
+        with psycopg.connect(PG_DSN) as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [
+            {"id": row[0], "text": row[1], "metadata": row[2], "score": float(row[3])}
+            for row in rows
+        ]
+
+    def delete(name, body):
+        table = _table(name)
+        ids = body.get("ids") or []
+        if not isinstance(ids, list):
+            raise ValueError("ids must be a list")
+        ids = [int(i) for i in ids]
+        if not ids:
+            return {"deleted": 0}
+        with psycopg.connect(PG_DSN) as conn, conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {table} WHERE id = ANY(%s)", (ids,))
+            conn.commit()
+            return {"deleted": cur.rowcount}
+
+    def count(name):
+        table = _table(name)
+        with psycopg.connect(PG_DSN) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            return {"count": int(cur.fetchone()[0])}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, fmt, *args):
+            sys.stdout.write("%s - %s\n" % (self.address_string(), fmt % args))
+            sys.stdout.flush()
+
+        def _read_body(self):
+            length = int(self.headers.get("content-length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            return json.loads(raw.decode("utf-8")) if raw else {}
+
+        def _reply_json(self, status, payload):
+            data = json.dumps(payload, default=str).encode("utf-8")
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("connection", "close")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _err(self, status, msg):
+            self._reply_json(status, {"error": msg})
+
+        def do_GET(self):
+            if self.path in ("/", ""):
+                try:
+                    with psycopg.connect(PG_DSN, connect_timeout=5) as c:
+                        c.execute("SELECT 1")
+                    self._reply_json(200, {"status": "ok"})
+                except Exception as exc:
+                    self._reply_json(503, {"status": "degraded", "pg_error": str(exc)})
+                return
+            m = _COLLECTION_GET_RE.match(self.path)
+            if m and m.group(2) == "count":
+                try:
+                    self._reply_json(200, count(m.group(1)))
+                except Exception as exc:
+                    self._err(500, f"count failed: {exc}")
+                return
+            self._err(404, f"unknown path {self.path}")
+
+        def do_POST(self):
+            try:
+                body = self._read_body()
+            except Exception as exc:
+                self._err(400, f"invalid JSON body: {exc}")
+                return
+            m = _COLLECTION_PATH_RE.match(self.path)
+            if not m:
+                self._err(404, f"unknown path {self.path}")
+                return
+            collection, op = m.group(1), m.group(2)
+            try:
+                if op == "init":
+                    init_collection(collection)
+                    self._reply_json(200, {"collection": collection, "status": "ready"})
+                    return
+                if op == "upsert":
+                    self._reply_json(200, upsert(collection, body))
+                    return
+                if op == "upsert_batch":
+                    items = body.get("items") or []
+                    if not isinstance(items, list):
+                        raise ValueError("items must be a list")
+                    results = [upsert(collection, item) for item in items]
+                    self._reply_json(200, {"results": results, "count": len(results)})
+                    return
+                if op == "search":
+                    self._reply_json(200, {"results": search(collection, body)})
+                    return
+                if op == "delete":
+                    self._reply_json(200, delete(collection, body))
+                    return
+                self._err(404, f"unknown op {op}")
+            except ValueError as exc:
+                self._err(400, str(exc))
+            except urllib.error.HTTPError as exc:
+                body_text = exc.read().decode("utf-8", errors="replace")[:300]
+                self._err(502, f"embedder {exc.code}: {body_text}")
+            except urllib.error.URLError as exc:
+                self._err(502, f"embedder unreachable: {exc.reason}")
+            except psycopg.Error as exc:
+                self._err(500, f"pg error: {exc}")
+            except Exception as exc:
+                self._err(500, f"unexpected error: {exc}")
+
+    if __name__ == "__main__":
+        for attempt in range(30):
+            try:
+                _ensure_extension()
+                print(f"connected to pgvector, ensured 'vector' extension", flush=True)
+                break
+            except Exception as exc:
+                print(f"waiting for pgvector ({attempt + 1}/30): {exc}", flush=True)
+                time.sleep(2)
+        else:
+            print("ERROR: pgvector not reachable after 60s, exiting", flush=True)
+            sys.exit(1)
+        server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
+        print(f"rag-search listening on 0.0.0.0:{LISTEN_PORT}", flush=True)
+        print(f"  pg={PG_DSN}", flush=True)
+        print(f"  embed={EMBED_URL} model={EMBED_MODEL} dim={VECTOR_DIM}", flush=True)
+        server.serve_forever()

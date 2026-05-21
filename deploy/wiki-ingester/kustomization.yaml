@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: lab-domains-sre
+# secret.yaml is intentionally excluded — create the secret out-of-band
+# with real credentials (see README) so the placeholder token never ends
+# up in git or kubectl apply output.
+resources:
+  - pvc.yaml
+  - configmap.yaml
+  - cronjob.yaml

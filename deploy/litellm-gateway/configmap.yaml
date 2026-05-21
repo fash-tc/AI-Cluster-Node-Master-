@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-gateway-config
+  namespace: lab-domains-sre
+data:
+  config.yaml: |
+    model_list:
+      # Heavy reasoning: deep multi-step thinking, long-context log analysis
+      - model_name: qwen3-235b-thinking
+        litellm_params:
+          model: hosted_vllm/qwen3-235b-thinking
+          api_base: http://domains-qwen3-235b.lab-domains-sre.svc.cluster.local:8000/v1
+          api_key: not-needed
+
+      # Fast tier: triage, RAG answers, conversational Q&A — HA pair, load balanced
+      - model_name: qwen3-32b-thinking
+        litellm_params:
+          model: hosted_vllm/qwen3-32b-thinking
+          api_base: http://domains-qwen3-32b-aicompute02.lab-domains-sre.svc.cluster.local:8000/v1
+          api_key: not-needed
+      - model_name: qwen3-32b-thinking
+        litellm_params:
+          model: hosted_vllm/qwen3-32b-thinking
+          api_base: http://domains-qwen3-32b-aicompute03.lab-domains-sre.svc.cluster.local:8000/v1
+          api_key: not-needed
+
+    router_settings:
+      routing_strategy: simple-shuffle
+      num_retries: 2
+      request_timeout: 600
+      cooldown_time: 30
+
+    litellm_settings:
+      drop_params: true
+      set_verbose: false
+      json_logs: true
+      request_timeout: 600
+
+    general_settings:
+      disable_spend_logs: true
+      disable_master_key_return: true

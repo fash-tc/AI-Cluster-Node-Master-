@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: wiki-ingester
+  namespace: lab-domains-sre
+spec:
+  # Daily at 03:30 UTC (off-hours for North America).
+  schedule: "30 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 604800
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: ingester
+              image: python:3.12-slim
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+              args:
+                - |
+                  set -e
+                  export PYTHONPATH=/pydeps:${PYTHONPATH:-}
+                  if ! python3 -c "import html2text" >/dev/null 2>&1; then
+                    echo "installing html2text into /pydeps"
+                    python3 -m pip install --no-cache-dir --quiet --target /pydeps "html2text==2024.2.26"
+                  fi
+                  exec python3 -u /app/ingest.py
+              env:
+                - name: CONFLUENCE_SITE
+                  value: https://wiki-tucows.atlassian.net
+                - name: SPACE_KEY
+                  value: OCC
+                - name: RAG_BASE
+                  value: http://domains-rag-search.lab-domains-sre.svc.cluster.local:8081
+                - name: COLLECTION
+                  value: occ_wiki
+                - name: ATLASSIAN_EMAIL
+                  valueFrom:
+                    secretKeyRef:
+                      name: wiki-ingester-creds
+                      key: ATLASSIAN_EMAIL
+                - name: ATLASSIAN_API_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: wiki-ingester-creds
+                      key: ATLASSIAN_API_TOKEN
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
+              volumeMounts:
+                - name: pydeps
+                  mountPath: /pydeps
+                - name: code
+                  mountPath: /app
+          volumes:
+            - name: pydeps
+              persistentVolumeClaim:
+                claimName: wiki-ingester-pydeps
+            - name: code
+              configMap:
+                name: wiki-ingester-code

@@ -1,0 +1,319 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ollama-shim-code
+  namespace: lab-domains-sre
+data:
+  shim.py: |
+    """
+    Ollama -> OpenAI translation shim.
+
+    Lets Ollama-API clients (e.g. UIP's enricher, IDE plugins) talk to the
+    LiteLLM gateway as if it were an Ollama server. Chat/generate requests
+    are translated to /v1/chat/completions and /v1/completions; embed
+    requests are forwarded to the dedicated Ollama embeddings service which
+    already speaks native Ollama API.
+
+    Stdlib only. No pip deps so it runs on python:3.12-slim unchanged.
+    """
+    import json
+    import os
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    GATEWAY_BASE = os.environ.get(
+        "GATEWAY_BASE",
+        "http://domains-llm-gateway.lab-domains-sre.svc.cluster.local:4000",
+    ).rstrip("/")
+    EMBEDDINGS_BASE = os.environ.get(
+        "EMBEDDINGS_BASE",
+        "http://domains-embeddings.lab-domains-sre.svc.cluster.local:11434",
+    ).rstrip("/")
+    LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "11434"))
+    # Models exposed via /api/tags. Update this list when the gateway gains
+    # new model routes.
+    TAGS = [
+        {
+            "name": "qwen3-32b-thinking",
+            "model": "qwen3-32b-thinking",
+            "size": 0,
+            "digest": "n/a",
+            "details": {"family": "qwen3", "parameter_size": "32B", "quantization_level": "FP8"},
+        },
+        {
+            "name": "qwen3-235b-thinking",
+            "model": "qwen3-235b-thinking",
+            "size": 0,
+            "digest": "n/a",
+            "details": {"family": "qwen3", "parameter_size": "235B", "quantization_level": "FP8"},
+        },
+        {
+            "name": "bge-m3",
+            "model": "bge-m3",
+            "size": 0,
+            "digest": "n/a",
+            "details": {"family": "bge", "parameter_size": "560M", "quantization_level": "fp16"},
+        },
+    ]
+
+    def _post_json(url, payload, timeout):
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _ollama_to_openai_chat(ollama_body):
+        """
+        Map an Ollama /api/chat body to an OpenAI /v1/chat/completions body.
+        """
+        out = {
+            "model": ollama_body.get("model"),
+            "messages": ollama_body.get("messages") or [],
+            "stream": False,
+        }
+        # Ollama's options sub-object -> OpenAI top-level fields
+        options = ollama_body.get("options") or {}
+        if "num_predict" in options and options["num_predict"] is not None:
+            out["max_tokens"] = int(options["num_predict"])
+        if "temperature" in options:
+            out["temperature"] = options["temperature"]
+        if "top_p" in options:
+            out["top_p"] = options["top_p"]
+        if "seed" in options:
+            out["seed"] = options["seed"]
+        if "stop" in options:
+            out["stop"] = options["stop"]
+        # JSON output
+        fmt = ollama_body.get("format")
+        if fmt == "json":
+            out["response_format"] = {"type": "json_object"}
+        # Ollama's `think` flag -> vLLM's enable_thinking chat-template kwarg
+        if "think" in ollama_body:
+            out["chat_template_kwargs"] = {"enable_thinking": bool(ollama_body["think"])}
+        # Tools pass through unchanged
+        if "tools" in ollama_body:
+            out["tools"] = ollama_body["tools"]
+        return out
+
+    def _openai_to_ollama_chat(openai_resp, model):
+        """
+        Map an OpenAI chat-completion response to Ollama's /api/chat shape.
+
+        vLLM with --reasoning-parser puts the assistant text into the
+        `reasoning_content` field even when no thinking happened. The enricher
+        only reads `message.content`, so coalesce both fields here.
+        """
+        choices = openai_resp.get("choices") or [{}]
+        msg = (choices[0] or {}).get("message") or {}
+        content = msg.get("content") or ""
+        if not content:
+            content = msg.get("reasoning_content") or ""
+        usage = openai_resp.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        return {
+            "model": model,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "message": {"role": "assistant", "content": content},
+            "done": True,
+            "done_reason": (choices[0] or {}).get("finish_reason") or "stop",
+            "prompt_eval_count": prompt_tokens,
+            "eval_count": completion_tokens,
+            "total_duration": 0,
+            "load_duration": 0,
+            "prompt_eval_duration": 0,
+            "eval_duration": 0,
+        }
+
+    def _openai_to_ollama_generate(openai_resp, model):
+        """
+        Map an OpenAI completion or chat-completion response to Ollama's
+        /api/generate shape, which exposes the text in `response` not `message`.
+        """
+        choices = openai_resp.get("choices") or [{}]
+        first = choices[0] or {}
+        # /v1/chat/completions returns message.content; /v1/completions returns text
+        text = ""
+        msg = first.get("message")
+        if isinstance(msg, dict):
+            text = msg.get("content") or msg.get("reasoning_content") or ""
+        if not text:
+            text = first.get("text") or ""
+        usage = openai_resp.get("usage") or {}
+        return {
+            "model": model,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "response": text,
+            "done": True,
+            "done_reason": first.get("finish_reason") or "stop",
+            "prompt_eval_count": int(usage.get("prompt_tokens") or 0),
+            "eval_count": int(usage.get("completion_tokens") or 0),
+        }
+
+    def _forward(url, body, timeout=300):
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(), dict(resp.headers)
+
+    class Shim(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, fmt, *args):
+            sys.stdout.write("%s - %s\n" % (self.address_string(), fmt % args))
+            sys.stdout.flush()
+
+        def _read_body(self):
+            length = int(self.headers.get("content-length", "0"))
+            return self.rfile.read(length) if length else b""
+
+        def _reply_json(self, status, payload):
+            data = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("connection", "close")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _reply_error(self, status, message):
+            self._reply_json(status, {"error": message})
+
+        def do_GET(self):
+            if self.path in ("/", ""):
+                self._reply_json(200, {"status": "ok"})
+                return
+            if self.path == "/api/tags":
+                self._reply_json(200, {"models": TAGS})
+                return
+            if self.path == "/api/version":
+                self._reply_json(200, {"version": "shim-1.0"})
+                return
+            self._reply_error(404, f"unknown path {self.path}")
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("connection", "close")
+            self.end_headers()
+
+        def do_POST(self):
+            body = self._read_body()
+
+            if self.path == "/api/chat":
+                self._handle_chat(body)
+                return
+            if self.path == "/api/generate":
+                self._handle_generate(body)
+                return
+            if self.path in ("/api/embed", "/api/embeddings"):
+                self._handle_embed(body)
+                return
+            if self.path == "/api/pull":
+                # Pre-loaded models. Pretend the pull is instantly done so
+                # Ollama clients that wait_for_model() don't error out.
+                self._reply_json(200, {"status": "success"})
+                return
+            if self.path == "/api/show":
+                # Minimal Ollama-compatible show response.
+                try:
+                    parsed = json.loads(body) if body else {}
+                except json.JSONDecodeError:
+                    parsed = {}
+                model = parsed.get("name") or parsed.get("model") or ""
+                self._reply_json(200, {
+                    "modelfile": "",
+                    "parameters": "",
+                    "template": "",
+                    "details": {"family": "qwen3" if "qwen" in model else "bge"},
+                })
+                return
+            self._reply_error(404, f"unknown path {self.path}")
+
+        def _handle_chat(self, body):
+            try:
+                parsed = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                self._reply_error(400, f"invalid JSON: {exc}")
+                return
+            model = parsed.get("model") or ""
+            openai_body = _ollama_to_openai_chat(parsed)
+            try:
+                resp = _post_json(f"{GATEWAY_BASE}/v1/chat/completions", openai_body, timeout=600)
+            except urllib.error.HTTPError as exc:
+                body_text = exc.read().decode("utf-8", errors="replace")[:500]
+                self._reply_error(exc.code, f"gateway {exc.code}: {body_text}")
+                return
+            except Exception as exc:
+                self._reply_error(502, f"gateway unreachable: {exc}")
+                return
+            self._reply_json(200, _openai_to_ollama_chat(resp, model))
+
+        def _handle_generate(self, body):
+            try:
+                parsed = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                self._reply_error(400, f"invalid JSON: {exc}")
+                return
+            model = parsed.get("model") or ""
+            prompt = parsed.get("prompt") or ""
+            # Wrap legacy /api/generate as a single-user-message chat call.
+            shoehorn = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "options": parsed.get("options") or {},
+                "format": parsed.get("format"),
+                "think": parsed.get("think"),
+            }
+            openai_body = _ollama_to_openai_chat(shoehorn)
+            try:
+                resp = _post_json(f"{GATEWAY_BASE}/v1/chat/completions", openai_body, timeout=600)
+            except urllib.error.HTTPError as exc:
+                body_text = exc.read().decode("utf-8", errors="replace")[:500]
+                self._reply_error(exc.code, f"gateway {exc.code}: {body_text}")
+                return
+            except Exception as exc:
+                self._reply_error(502, f"gateway unreachable: {exc}")
+                return
+            self._reply_json(200, _openai_to_ollama_generate(resp, model))
+
+        def _handle_embed(self, body):
+            # Pure forward to the embeddings service, which already speaks
+            # native Ollama embed API. Preserve the upstream JSON verbatim.
+            try:
+                status, data, headers = _forward(f"{EMBEDDINGS_BASE}{self.path}", body, timeout=120)
+            except urllib.error.HTTPError as exc:
+                err = exc.read()
+                self.send_response(exc.code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(err)))
+                self.send_header("connection", "close")
+                self.end_headers()
+                self.wfile.write(err)
+                return
+            except Exception as exc:
+                self._reply_error(502, f"embeddings unreachable: {exc}")
+                return
+            self.send_response(status)
+            self.send_header("content-type", headers.get("content-type", "application/json"))
+            self.send_header("content-length", str(len(data)))
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+
+    if __name__ == "__main__":
+        server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Shim)
+        print(f"ollama-shim listening on 0.0.0.0:{LISTEN_PORT}, gateway={GATEWAY_BASE}, embeddings={EMBEDDINGS_BASE}")
+        sys.stdout.flush()
+        server.serve_forever()

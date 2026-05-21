@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: lab-domains-sre
+resources:
+  - pgvector-pvc.yaml
+  - pgvector-secret.yaml
+  - pgvector-deployment.yaml
+  - pgvector-service.yaml
+  - embeddings-pvc.yaml
+  - embeddings-deployment.yaml
+  - embeddings-service.yaml

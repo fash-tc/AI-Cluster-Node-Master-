@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-search
+  namespace: lab-domains-sre
+spec:
+  replicas: 0
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: rag-search
+  template:
+    metadata:
+      labels:
+        app: rag-search
+    spec:
+      containers:
+        - name: rag
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              set -e
+              export PYTHONPATH=/pydeps:${PYTHONPATH:-}
+              # Idempotent: only reinstall if the marker is missing or version drifted.
+              if ! python3 -c "import psycopg; assert psycopg.__version__.startswith('3.2')" >/dev/null 2>&1; then
+                echo "installing psycopg[binary]==3.2.3 into /pydeps"
+                python3 -m pip install --no-cache-dir --quiet --target /pydeps "psycopg[binary]==3.2.3"
+              else
+                echo "psycopg already present in /pydeps"
+              fi
+              exec python3 -u /app/rag.py
+          env:
+            - name: PG_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: rag-search-pg-dsn
+                  key: dsn
+            - name: EMBED_URL
+              value: http://domains-embeddings.lab-domains-sre.svc.cluster.local:11434/api/embed
+            - name: EMBED_MODEL
+              value: bge-m3
+            - name: VECTOR_DIM
+              value: "1024"
+            - name: LISTEN_PORT
+              value: "8081"
+          ports:
+            - containerPort: 8081
+              name: http
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "128Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+          volumeMounts:
+            - name: pydeps
+              mountPath: /pydeps
+            - name: code
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8081
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 6
+      volumes:
+        - name: pydeps
+          persistentVolumeClaim:
+            claimName: rag-search-pydeps
+        - name: code
+          configMap:
+            name: rag-search-code
