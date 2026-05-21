@@ -41,7 +41,7 @@ resp = client.chat.completions.create(
     model="qwen3-32b-thinking",
     messages=[
         {"role": "system", "content": "Reply only with valid JSON."},
-        {"role": "user", "content": "Classify: 'API p95 latency 80ms->2400ms'"},
+        {"role": "user", "content": "Extract entities from: 'Acme Corp announced a partnership with Beta Inc on March 14, 2026.'"},
     ],
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     response_format={"type": "json_object"},
@@ -55,7 +55,7 @@ print(resp.choices[0].message.content)
 ```python
 resp = client.chat.completions.create(
     model="qwen3-235b-thinking",  # heavy tier
-    messages=[{"role": "user", "content": "Three alerts: ... explain why they correlate."}],
+    messages=[{"role": "user", "content": "Walk through the steps required to refactor the following function safely: ..."}],
     extra_body={"chat_template_kwargs": {"enable_thinking": True}},
     max_tokens=2000,
 )
@@ -158,29 +158,32 @@ If you need streaming, use the OpenAI gateway directly.
 
 ### `qwen3-32b-thinking` (the default — use this first)
 
-- Alert triage (severity classification, service identification)
-- Runbook Q&A grounded in RAG retrieval
-- Structured output (JSON-mode classifications)
+- Classification (severity, intent, category, etc.)
+- Structured output via JSON-mode
+- RAG-grounded Q&A (combine with retrieval from rag-search)
 - Conversational responses
-- "What does this Zabbix alert mean?" type questions
+- Tool calling via the OpenAI `tools` schema
+- Short-to-medium summarization
 
 Two replicas, load-balanced. 16 concurrent sequences supported. 32K
-context — plenty for an alert + a few thousand lines of relevant log.
+context — comfortable for a prompt plus several thousand lines of
+retrieved context.
 
 ### `qwen3-235b-thinking` (when 32B isn't enough)
 
-- Multi-alert correlation ("why do these three alerts fire together?")
-- Long log dump analysis (paste 30 KB of syslog, ask for a summary)
-- Multi-step reasoning ("trace through this incident timeline")
-- Postmortem drafting
-- Anything where the 32B's answer feels shallow or uncertain
+- Long-context document analysis (paste tens of KB of text and ask for
+  a structured summary)
+- Multi-step reasoning that benefits from explicit chain-of-thought
+- Synthesis across multiple sources ("given these N pieces of evidence,
+  what conclusion do they jointly support?")
+- Anything where the 32B's answer feels shallow or low-confidence
 
 One replica. 2 concurrent sequences. 65K context. Roughly 4× slower per
 token than the 32B and uses significantly more memory thanks to the
 expert pool living in Grace LPDDR5X.
 
-A reasonable pattern: try the 32B first; if it says "I'm not sure" or
-produces a low-confidence classification, retry on the 235B.
+A reasonable pattern: try the 32B first; if its answer is uncertain or
+the model self-reports low confidence, retry on the 235B.
 
 ### `bge-m3`
 

@@ -10,9 +10,9 @@ flow, why each component exists, or how the layers fit together.
                               ┌───────────────────────────────────────┐
                               │  External clients (anywhere with      │
                               │  network access to a compute node):   │
-                              │    - UIP alert-enricher               │
-                              │    - UIP opensrs-health-api           │
-                              │    - IDE plugins / scripts            │
+                              │    - Any OpenAI-compatible app or SDK │
+                              │    - Any Ollama-compatible client     │
+                              │    - IDE plugins, agents, scripts     │
                               │    - This cluster's own jobs          │
                               └────────────────┬──────────────────────┘
                                                │
@@ -158,11 +158,16 @@ JSONB`, `embedding vector(1024)`, timestamps. Filter at search time via
 
 ### wiki-ingester (CronJob, daily 03:30 UTC)
 
-Pulls the OCC Confluence space via Atlassian REST API, converts storage
-XHTML to text via `html2text`, chunks by heading + paragraph, and
-upserts into the `occ_wiki` collection. Idempotent — chunk IDs are
-deterministic (`page_id * 1000 + chunk_index`) so re-running just
-refreshes content.
+A generic Confluence-to-RAG ingestion job. Configured via env vars
+(`SPACE_KEY`, `COLLECTION`, `CONFLUENCE_SITE`) to pull a specific
+Confluence space via Atlassian REST API, convert storage XHTML to text
+via `html2text`, chunk by heading + paragraph, and upsert into a
+rag-search collection. Idempotent — chunk IDs are deterministic
+(`page_id * 1000 + chunk_index`) so re-running just refreshes content.
+
+Today this CronJob is configured to sync one space into one collection;
+to add a second space, deploy a second CronJob with different env vars
+and a different secret.
 
 ## Request flows
 
@@ -236,11 +241,11 @@ Client                rag-search (:31445)         embeddings (CIP)        pgvect
   │                       │                            │                       │
   │  POST                  │                            │                       │
   │  /v1/collections/      │                            │                       │
-  │   sre_runbooks/search  │                            │                       │
+  │   my_collection/search │                            │                       │
   │  {query:"...",         │                            │                       │
   │   top_k: 10,           │                            │                       │
   │   filter:{             │                            │                       │
-  │     service:"checkout"}│                            │                       │
+  │     category:"foo"}    │                            │                       │
   │  }                     │                            │                       │
   ├──────────────────────► │                            │                       │
   │                        │ POST /api/embed             │                       │
@@ -253,7 +258,7 @@ Client                rag-search (:31445)         embeddings (CIP)        pgvect
   │                        │  SELECT id, text, metadata, │                       │
   │                        │  1 - (embedding <=>         │                       │
   │                        │       %s::vector) AS score  │                       │
-  │                        │  FROM rag_sre_runbooks      │                       │
+  │                        │  FROM rag_my_collection     │                       │
   │                        │  WHERE metadata @> %s       │                       │
   │                        │  ORDER BY embedding <=>     │                       │
   │                        │       %s::vector            │                       │

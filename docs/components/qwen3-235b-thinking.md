@@ -64,16 +64,18 @@ there is no load balancing because there is only one replica.
 
 ## When to use it
 
-- Multi-step reasoning ("trace through this incident")
-- Long-context log analysis (paste ~30 KB of syslog, ask for a summary)
-- Multi-alert correlation
-- Postmortem drafting
+- Multi-step reasoning that benefits from explicit chain-of-thought
+- Long-context document analysis (paste tens of KB of text and ask for a
+  structured summary or decomposition)
+- Synthesis across multiple sources ("given these N pieces of evidence,
+  what conclusion do they jointly support?")
+- Code review / refactoring proposals on non-trivial code
 - Backstop when the 32B's answer is shallow or low-confidence
 
 Avoid for:
 
-- Triage at high QPS — the 235B's queue saturates at 2 concurrent
-  sequences and TPS is ~4× slower than the 32B
+- High-QPS, latency-sensitive paths — the 235B's queue saturates at 2
+  concurrent sequences and TPS is ~4× slower than the 32B
 - Anything where a 32B answer is good enough — escalate intentionally,
   not by default
 
@@ -88,8 +90,8 @@ Avoid for:
 This deployment is intentionally single-replica. Adding a second 235B
 replica would need a second physical GH200 node and would still not
 have cross-node speedup (no RDMA). If 235B throughput becomes a
-problem, the right move is **smaller-model triage upstream + 235B only
-for hard cases**, not "more 235B replicas."
+problem, the right move is **route easy requests to the 32B and reserve
+the 235B for the genuinely hard ones**, not "more 235B replicas."
 
 ## History
 

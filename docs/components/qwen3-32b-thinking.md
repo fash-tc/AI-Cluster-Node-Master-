@@ -43,11 +43,11 @@ The model is a "thinking" variant that can run in two modes per
 request:
 
 - `enable_thinking: false` — produces a direct answer, no
-  `<think>...</think>` reasoning trace. Use this for fast triage,
-  classification, structured output.
+  `<think>...</think>` reasoning trace. Use this for snappy
+  classification, structured output, simple Q&A.
 - `enable_thinking: true` (default) — produces a reasoning trace
   followed by the answer. Use this when you want chain-of-thought,
-  multi-step diagnosis, or self-correction.
+  multi-step reasoning, or self-correction.
 
 Pass it via `chat_template_kwargs` in OpenAI-shaped requests:
 
@@ -82,9 +82,10 @@ debugging or pinning to a specific replica during canaries.
 Qwen3-32B's native `max_position_embeddings` is 40 960. Going beyond
 that requires YaRN rope scaling, which adds config surface and accuracy
 risk. We picked **32K** as a clean round number well below the native
-limit. For SRE workloads — alerts plus a few thousand log lines — 32K
-is comfortable. See [gotchas](../gotchas.md#qwen3-native-context-is-40k-not-131k)
-for the gory details.
+limit. For most use — a prompt plus a few thousand lines of retrieved
+context — 32K is comfortable. See
+[gotchas](../gotchas.md#qwen3-native-context-is-40k-not-131k) for the
+details.
 
 ## Throughput sizing
 
@@ -103,10 +104,10 @@ If you anticipate sustained higher concurrency:
 ## When to use it
 
 - Default tier for everything chat-shaped
-- Triage, structured output (with `response_format: {"type": "json_object"}`)
-- Runbook Q&A
+- Classification, structured output (with `response_format: {"type": "json_object"}`)
+- RAG-grounded Q&A (combine with rag-search retrieval)
 - Conversational responses
-- "Tool calls" via standard OpenAI `tools: [...]` interface
+- Tool calling via standard OpenAI `tools: [...]` interface
 
 For deeper reasoning, see [qwen3-235b-thinking.md](qwen3-235b-thinking.md).
 

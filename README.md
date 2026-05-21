@@ -14,14 +14,14 @@ the current state, not aspirations.
 
 | Service | Purpose | Front door |
 |---|---|---|
-| **Qwen3-235B-A22B-Thinking** | Heavyweight reasoning (log analysis, multi-step diagnosis) | `:31441/v1` (OpenAI) |
-| **Qwen3-32B (×2 replicas)** | Fast tier (triage, runbook Q&A, conversational) | `:31442/v1`, `:31443/v1` (OpenAI) |
+| **Qwen3-235B-A22B-Thinking** | Heavyweight reasoning (long-context analysis, multi-step problem decomposition) | `:31441/v1` (OpenAI) |
+| **Qwen3-32B (×2 replicas)** | Fast tier (classification, structured output, conversational, RAG-grounded Q&A) | `:31442/v1`, `:31443/v1` (OpenAI) |
 | **LiteLLM Gateway** | OpenAI front door + load balancing across the 32B pair | `:31440/v1` |
 | **Ollama Shim** | Translates Ollama API → OpenAI gateway (for Ollama-pinned clients) | `:31434` (Ollama API) |
 | **rag-search** | Generic embeddings + pgvector wrapper; multi-tenant by collection | `:31445/v1/collections/{name}/...` |
 | **pgvector** | PostgreSQL 17 + vector extension; in-cluster only | ClusterIP `:5432` |
 | **Ollama embeddings (bge-m3)** | 1024-dim embeddings for RAG | ClusterIP `:11434/api/embed` (or via shim externally) |
-| **wiki-ingester** | Daily CronJob syncing Confluence OCC space into the `occ_wiki` RAG collection | (internal job) |
+| **wiki-ingester** | Daily CronJob syncing a configured Confluence space into a RAG collection | (internal job) |
 
 All NodePorts are reachable on **any** compute node IP — `aicompute01`,
 `aicompute02`, and `aicompute03` all route the same.
@@ -52,16 +52,16 @@ curl http://aicompute01.cnco1.tucows.cloud:31434/api/chat \
 **Search a RAG collection:**
 
 ```bash
-curl -X POST http://aicompute01.cnco1.tucows.cloud:31445/v1/collections/occ_wiki/search \
+curl -X POST http://aicompute01.cnco1.tucows.cloud:31445/v1/collections/<your-collection>/search \
   -H "Content-Type: application/json" \
-  -d '{"query":"how do I restart zabbix agents","top_k":3}'
+  -d '{"query":"what does this document say about X","top_k":3}'
 ```
 
 **Embed text:**
 
 ```bash
 curl http://aicompute01.cnco1.tucows.cloud:31434/api/embed \
-  -d '{"model":"bge-m3","input":"alert text here"}'
+  -d '{"model":"bge-m3","input":"text to embed"}'
 ```
 
 ## Repository layout
@@ -115,8 +115,8 @@ Internal-only (ClusterIP):
 
 | Model name (use in API calls) | Backend | When to use |
 |---|---|---|
-| `qwen3-32b-thinking` | Qwen3-32B FP8, two replicas behind LiteLLM | Default. Triage, structured-output classification, runbook Q&A, conversational. Hybrid thinking — pass `chat_template_kwargs: {"enable_thinking": false}` to disable for fast responses. |
-| `qwen3-235b-thinking` | Qwen3-235B-A22B-Thinking-2507-FP8 (MoE) on one GH200 with Grace offload | Deep reasoning, multi-step diagnosis, log correlation, "explain why these three alerts correlate". Slower and more expensive — escalate to it only when the 32B is uncertain. |
+| `qwen3-32b-thinking` | Qwen3-32B FP8, two replicas behind LiteLLM | Default. Classification, structured output (JSON-mode), conversational responses, RAG-grounded Q&A, tool calls. Hybrid thinking — pass `chat_template_kwargs: {"enable_thinking": false}` to disable the reasoning trace for snappier responses. |
+| `qwen3-235b-thinking` | Qwen3-235B-A22B-Thinking-2507-FP8 (MoE) on one GH200 with Grace offload | Deep reasoning: long-context document analysis, multi-step problem decomposition, correlated-evidence synthesis. Slower and more expensive — escalate to it only when the 32B is uncertain. |
 | `bge-m3` | Ollama serving BAAI/bge-m3 | 1024-dim embeddings. Multilingual, hybrid dense+sparse. Used internally by rag-search; can be called directly. |
 
 ## How to use the cluster

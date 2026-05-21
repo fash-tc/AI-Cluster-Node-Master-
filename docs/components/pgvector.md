@@ -96,19 +96,19 @@ SELECT relname AS table, n_live_tup AS rows
   ORDER BY n_live_tup DESC;
 
 -- Peek at a collection's contents
-SELECT id, LEFT(text, 80) AS preview, metadata->>'service' AS svc
-  FROM rag_sre_runbooks
+SELECT id, LEFT(text, 80) AS preview, metadata->>'category' AS category
+  FROM rag_<your_collection>
   ORDER BY updated_at DESC
   LIMIT 5;
 
 -- Truncate a collection (no undo — be sure)
-TRUNCATE rag_yourcollection;
+TRUNCATE rag_<your_collection>;
 
 -- Drop a collection entirely
-DROP TABLE rag_yourcollection;
+DROP TABLE rag_<your_collection>;
 
 -- Check HNSW index health
-\d+ rag_sre_runbooks
+\d+ rag_<your_collection>
 ```
 
 ## Backup

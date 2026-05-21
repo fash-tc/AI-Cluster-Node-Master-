@@ -5,8 +5,9 @@ Tiny stdlib-only HTTP service that exposes an Ollama-compatible API
 `/api/show`, `/api/version`) and translates requests to the cluster's
 OpenAI-compatible LiteLLM gateway plus the Ollama embeddings backend.
 
-Lets existing Ollama clients — UIP's `alert-enricher`, IDE plugins,
-ad-hoc scripts — point at this endpoint with **only an env-var change**.
+Lets existing Ollama clients — IDE plugins, agent frameworks, ad-hoc
+scripts, anything hard-coded to the Ollama API — point at this endpoint
+with **only an env-var change**.
 
 ## Endpoint
 
@@ -31,41 +32,30 @@ so callers configured for a remote Ollama need no port change either.
 | `POST /api/show` | Returns a minimal stub; real metadata is in the gateway |
 | Streaming responses | **Not supported.** All chat requests are forwarded non-streaming (`stream:false`). Clients that depend on `stream:true` won't work. |
 
-## UIP integration changes
+## Pointing a client at the shim
 
-Two env vars on the UIP host (`/home/fash/uip/.env`):
+Typical Ollama client configurations expose an `OLLAMA_URL` /
+`OLLAMA_HOST` / `--host` flag. Set it to the shim's endpoint:
 
 ```bash
-# alert-enricher
 OLLAMA_URL=http://aicompute01.cnco1.tucows.cloud:31434
-OLLAMA_MODEL=qwen3-32b-thinking
-
-# opensrs-health-api still uses OpenAI shape - point at the gateway directly
-OPENAI_API_BASE=http://aicompute01.cnco1.tucows.cloud:31440/v1
-OPENAI_MODEL=qwen3-32b-thinking
+OLLAMA_MODEL=qwen3-32b-thinking   # or qwen3-235b-thinking, bge-m3
 ```
 
-After updating, restart UIP services:
-
-```bash
-cd /home/fash/uip
-docker compose up -d alert-enricher opensrs-health-api
-```
-
-The in-stack `ollama` container in `docker-compose.yml` can be retired
-(scale to 0 replicas or remove the service block entirely) once UIP is
-talking to the cluster.
+The client should "just work" without further changes. If you want to
+verify outside any framework, the sanity-check command below speaks
+the exact wire format Ollama clients use.
 
 ## Apply
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' apply -k 'C:\Users\fash\Desktop\AI Nodes\deploy\ollama-shim'
+```bash
+kubectl apply -k deploy/ollama-shim
 ```
 
 ## Scale up
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' -n lab-domains-sre scale deploy/ollama-shim --replicas=1
+```bash
+kubectl -n lab-domains-sre scale deploy/ollama-shim --replicas=1
 ```
 
 ## Sanity check (from outside the cluster)
@@ -74,8 +64,13 @@ talking to the cluster.
 # list models
 curl http://aicompute01.cnco1.tucows.cloud:31434/api/tags
 
-# chat completion (matches enricher.py's request shape)
+# chat completion
 curl http://aicompute01.cnco1.tucows.cloud:31434/api/chat \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3-32b-thinking","messages":[{"role":"user","content":"Say ready"}],"stream":false,"think":false,"options":{"num_predict":40}}'
+
+# embed text
+curl http://aicompute01.cnco1.tucows.cloud:31434/api/embed \
+  -H "Content-Type: application/json" \
+  -d '{"model":"bge-m3","input":"hello world"}'
 ```

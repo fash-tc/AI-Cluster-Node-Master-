@@ -52,7 +52,7 @@ POST /v1/collections/{name}/init
 Idempotent. Creates the table, the HNSW index on `embedding`, and the
 GIN index on `metadata`. Safe to call at the start of every ingest job.
 
-Response: `{"collection":"sre_runbooks","status":"ready"}`.
+Response: `{"collection":"<name>","status":"ready"}`.
 
 ### Upsert one item
 
@@ -97,16 +97,17 @@ reasonable.
 ```
 POST /v1/collections/{name}/search
 {
-  "query": "alert text or question",
+  "query": "natural-language question or document",
   "top_k": 10,
-  "filter": {"service": "checkout-api"}
+  "filter": {"category": "billing"}
 }
 ```
 
 - `top_k` defaults to 10, capped at 100.
 - `filter` is optional. When present, it's applied as a JSONB
   containment match: `metadata @> filter`. Use it for exact-match
-  filtering on metadata fields (`service`, `severity`, etc.).
+  filtering on whatever metadata keys you stored (`category`, `tags`,
+  `owner`, etc.).
 - `query` is embedded and matched by **cosine similarity** against the
   collection's `embedding` column, using the HNSW index.
 
@@ -118,7 +119,7 @@ Response:
     {
       "id": 42,
       "text": "...",
-      "metadata": {"service": "checkout-api", "severity": "high"},
+      "metadata": {"category": "billing", "owner": "finance"},
       "score": 0.8731
     },
     ...
@@ -162,10 +163,10 @@ requests.post(f"{BASE}/v1/collections/{COLL}/init", json={})
 
 # 2. upsert in batches
 docs = [
-    {"id": 1, "text": "When the queue backs up, scale workers.",
-     "metadata": {"service": "queue", "tags": ["scaling"]}},
-    {"id": 2, "text": "Database CPU > 80% means review slow queries.",
-     "metadata": {"service": "db",    "tags": ["performance"]}},
+    {"id": 1, "text": "First document content here.",
+     "metadata": {"category": "guides",   "tags": ["onboarding"]}},
+    {"id": 2, "text": "Second document content here.",
+     "metadata": {"category": "policies", "tags": ["security"]}},
     # ... many more
 ]
 for i in range(0, len(docs), 25):
@@ -181,9 +182,9 @@ print("count:", requests.get(f"{BASE}/v1/collections/{COLL}/count").json())
 
 ```python
 r = requests.post(f"{BASE}/v1/collections/{COLL}/search", json={
-    "query": "what should I do when queues back up",
+    "query": "what does our onboarding process look like",
     "top_k": 5,
-    "filter": {"service": "queue"},   # only match queue-related docs
+    "filter": {"category": "guides"},   # only match guides
 })
 for hit in r.json()["results"]:
     print(f"{hit['score']:.3f}  {hit['text'][:80]}")
@@ -191,15 +192,15 @@ for hit in r.json()["results"]:
 
 ### Citation-grounded LLM prompt
 
-The whole point of retrieval is to ground LLM answers in facts. A
-common pattern:
+The whole point of retrieval is to ground LLM answers in facts from
+your data. A common pattern:
 
 ```python
 from openai import OpenAI
 llm = OpenAI(base_url="http://aicompute01.cnco1.tucows.cloud:31440/v1",
              api_key="x")
 
-def answer_with_citations(question, collection="sre_runbooks"):
+def answer_with_citations(question, collection):
     hits = requests.post(
         f"{BASE}/v1/collections/{collection}/search",
         json={"query": question, "top_k": 5},
@@ -224,14 +225,14 @@ def answer_with_citations(question, collection="sre_runbooks"):
     )
     return resp.choices[0].message.content or resp.choices[0].message.reasoning_content
 
-print(answer_with_citations("how do I restart zabbix agents?"))
+print(answer_with_citations("what is the onboarding process?", "my_team_kb"))
 ```
 
 ### Hybrid keyword + dense search via RRF
 
 Pure dense search misses exact-string matches sometimes (e.g. a UUID or
 a specific error code). A common improvement: run a keyword scorer
-against your source database (BM25 or whatever you already have), run
+against your own source data (BM25 or PostgreSQL `tsvector`, etc.), run
 dense search against rag-search, then combine via reciprocal rank
 fusion:
 
@@ -248,23 +249,20 @@ def rrf_merge(keyword_hits, dense_hits, top_n=10):
     return sorted(scores.items(), key=lambda x: -x[1])[:top_n]
 ```
 
-This is exactly how UIP's `runbook-api` `/api/runbook/match` ranks
-results — see [components/rag-search.md](components/rag-search.md) for
-the full pattern.
+RRF is well known to improve recall over pure dense search when the
+source corpus contains identifiers, error codes, or short distinctive
+tokens that embedding models tend to smear together.
 
-## Existing collections
+## Picking a collection name
 
-Maintained centrally; talk to the owner before writing to a collection
-you don't own.
+There's no central registry. Pick a name that uniquely identifies your
+data (`yourteam_kb`, `yourapp_docs`, `projectx_runbooks`) and just call
+`/init`. No coordination needed — the underlying table is created on
+demand and no other consumer can see your rows unless they know the
+collection name.
 
-| Collection | Owner | Schema |
-|---|---|---|
-| `sre_runbooks` | UIP runbook-api | id=runbook SQLite row id; metadata: `{hostname, service, severity}` |
-| `occ_wiki` | wiki-ingester CronJob | id=page_id*1000+chunk_index; metadata: `{page_id, page_title, page_url, chunk_index, chunk_heading, source, space_key, updated_at}` |
-
-If you want your own collection, pick a name that says who owns it
-(`yourteam_runbooks`, `yourteam_docs`) and just call `/init`. No
-coordination needed — the table is created on demand.
+If you find a collection that already exists when you didn't expect it,
+treat it like any other shared resource: ask before writing to it.
 
 ## Limits and behavior
 
@@ -274,9 +272,9 @@ coordination needed — the table is created on demand.
   to clear a collection, `kubectl exec deploy/pgvector -- psql -U rag -d
   rag -c "TRUNCATE rag_yourcollection"`.
 - **No automatic cleanup of stale rows.** Deletions in the source
-  system do not propagate. The wiki-ingester re-runs daily and re-upserts
-  current pages, but deleted Confluence pages linger in `occ_wiki`.
-  Address it when it bites; not before.
+  system do not propagate. The wiki-ingester, for example, re-runs
+  daily and re-upserts current pages, but pages deleted in Confluence
+  linger in the collection. Address it when it bites; not before.
 - **Embedding model is hard-coded.** All collections use `bge-m3`
   (1024-dim). Mixing embedding models within a collection breaks
   similarity math. If you need a different model, request a separate

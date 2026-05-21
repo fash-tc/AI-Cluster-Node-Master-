@@ -1,7 +1,8 @@
 # Qwen3-235B-A22B-Thinking on aicompute01
 
-Single-node MoE reasoning model. Heavy reasoning route for SRE log analysis,
-root-cause inference, and any prompt that needs deep multi-step thinking.
+Single-node MoE reasoning model. Heavy reasoning route for long-context
+analysis, multi-step problem decomposition, and any prompt that benefits
+from explicit chain-of-thought.
 
 ## Topology
 
@@ -29,28 +30,28 @@ root-cause inference, and any prompt that needs deep multi-step thinking.
 
 ## Apply paused manifests
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' apply -k 'C:\Users\fash\Desktop\AI Nodes\deploy\qwen3-235b-thinking'
+```bash
+kubectl apply -k deploy/qwen3-235b-thinking
 ```
 
 ## Scale up (after node health check)
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' -n lab-domains-sre scale deploy/qwen3-235b-thinking --replicas=1
+```bash
+kubectl -n lab-domains-sre scale deploy/qwen3-235b-thinking --replicas=1
 ```
 
 Expect 30–90 min first start while the model downloads to the PVC.
 
 ## Wait for ready
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' -n lab-domains-sre rollout status deploy/qwen3-235b-thinking --timeout=120m
+```bash
+kubectl -n lab-domains-sre rollout status deploy/qwen3-235b-thinking --timeout=120m
 ```
 
 ## Rollback
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' -n lab-domains-sre scale deploy/qwen3-235b-thinking --replicas=0
+```bash
+kubectl -n lab-domains-sre scale deploy/qwen3-235b-thinking --replicas=0
 ```
 
 ## If aicompute01 goes NotReady during first scale-up

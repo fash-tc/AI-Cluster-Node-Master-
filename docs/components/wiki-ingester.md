@@ -1,7 +1,9 @@
 # wiki-ingester
 
-The Confluence → RAG sync job. A K8s CronJob that pulls the OCC
-Confluence space and upserts every page into the `occ_wiki` collection.
+A generic Confluence → RAG ingestion job. K8s CronJob that pulls a
+configured Confluence space and upserts every page into a rag-search
+collection. Configurable per deployment — point it at any space, write
+into any collection.
 
 ## What it is
 
@@ -9,7 +11,7 @@ Confluence space and upserts every page into the `occ_wiki` collection.
   into a PVC at first run, cached afterwards)
 - **Code:** [`deploy/wiki-ingester/configmap.yaml`](../../deploy/wiki-ingester/configmap.yaml)
 - **Bundle:** [`deploy/wiki-ingester/`](../../deploy/wiki-ingester/)
-- **Schedule:** Daily at **03:30 UTC**
+- **Schedule:** Daily at **03:30 UTC** (configurable in `cronjob.yaml`)
 - **Resources:** 100m-1 CPU, 128-512 MiB RAM, 256 MiB PVC
 
 ## Where it runs
@@ -17,12 +19,12 @@ Confluence space and upserts every page into the `occ_wiki` collection.
 Runs as a Kubernetes Job triggered by a CronJob. Each run is a fresh
 pod, scheduled on whichever node has capacity. The PVC
 (`wiki-ingester-pydeps`) caches the pip-installed `html2text` package
-so subsequent runs start quickly.
+so subsequent runs start in seconds rather than re-installing.
 
 ## What it does
 
 1. Authenticate to Atlassian via Basic Auth (email:token from K8s Secret)
-2. `GET /wiki/api/v2/spaces?keys=OCC&limit=5` — resolve the space ID
+2. `GET /wiki/api/v2/spaces?keys=<SPACE_KEY>&limit=5` — resolve the space ID
 3. `GET /wiki/api/v2/spaces/{id}/pages?body-format=storage&limit=50`
    (paginated) — list all current pages with storage XHTML body
 4. For each page:
@@ -31,7 +33,7 @@ so subsequent runs start quickly.
      `<ri:*>` resource references)
    - Chunk by heading + paragraph (~2200 chars per chunk, 300-char
      minimum, merge tiny adjacent chunks)
-   - `POST /v1/collections/occ_wiki/upsert_batch` to rag-search, 25
+   - `POST /v1/collections/<COLLECTION>/upsert_batch` to rag-search, 25
      chunks per batch
 5. Print a per-page summary line; exit 0 on success, 1 on any failure
 
@@ -49,24 +51,25 @@ if triggered manually).
 ## What it does NOT do
 
 - **Delete pruning.** Pages deleted from Confluence linger in the
-  `occ_wiki` collection. The ingester doesn't track current vs. previous
-  page sets. Fix this if it ever bites by adding a diff step before
-  the upsert loop.
+  collection. The ingester doesn't track current vs. previous page
+  sets. Fix this if it ever bites by adding a diff step before the
+  upsert loop.
 - **Attachment ingestion.** Only page body text is indexed. Images,
   files, embedded charts are ignored.
 - **Comment ingestion.** Confluence inline and footer comments are not
   indexed.
-- **Cross-space sync.** Only the OCC space is configured. To add
-  another space, add a second CronJob (or parameterize this one) — don't
-  mix spaces in the same collection.
+- **Multi-space sync in one job.** Each CronJob deployment handles
+  exactly one `(SPACE_KEY, COLLECTION)` pair. To ingest a second space,
+  deploy a second instance of this bundle with different env vars and a
+  different secret name.
 
 ## Endpoints
 
 The ingester is internal-only — it has no service, no NodePort. It
 talks to:
 
-- **Atlassian REST API** at `https://wiki-tucows.atlassian.net/wiki/api/v2/...`
-  (outbound HTTPS from the cluster)
+- **Atlassian REST API** (outbound HTTPS from the cluster) at whatever
+  URL `CONFLUENCE_SITE` is set to
 - **rag-search** at `http://domains-rag-search.lab-domains-sre.svc.cluster.local:8081`
   (in-cluster HTTP)
 
@@ -75,9 +78,9 @@ talks to:
 Reasons to manually trigger:
 
 - Right after editing a Confluence page that needs to be searchable
-  immediately
+  immediately (don't wait for the next 03:30 UTC run)
 - Testing the ingester after a config change
-- Initial bulk fill after deploying the bundle
+- Initial bulk fill right after deploying the bundle
 
 Command:
 
@@ -87,7 +90,7 @@ kubectl -n lab-domains-sre create job --from=cronjob/wiki-ingester $JOB
 kubectl -n lab-domains-sre logs -f -l job-name=$JOB
 ```
 
-Expect ~3 minutes for a full re-ingest of ~25 pages.
+Expect about a minute per ~10 pages in the target space.
 
 ## Credentials
 
@@ -98,7 +101,7 @@ template but not listed under `resources:`). Create it out-of-band:
 
 ```bash
 kubectl -n lab-domains-sre create secret generic wiki-ingester-creds \
-  --from-literal=ATLASSIAN_EMAIL='your.email@tucows.com' \
+  --from-literal=ATLASSIAN_EMAIL='your.email@example.com' \
   --from-literal=ATLASSIAN_API_TOKEN='<paste-token-here>'
 ```
 
@@ -107,8 +110,8 @@ Token requirements:
 - Created at <https://id.atlassian.com/manage-profile/security/api-tokens>
 - Must have **Confluence read** scope (a Jira-only token returns 403 —
   see [gotchas](../gotchas.md#atlassian-api-token-must-have-confluence-scope))
-- Email must be the user's **Confluence** email, not their Jira email
-  if they differ (see [gotchas](../gotchas.md#atlassian-email-differs-by-product))
+- Email must be the user's **Confluence** login if it differs from
+  their Jira login (see [gotchas](../gotchas.md#atlassian-email-can-differ-by-product))
 
 To rotate the token:
 
@@ -122,27 +125,47 @@ kubectl -n lab-domains-sre create secret generic wiki-ingester-creds \
 
 ## Configuration
 
-| Env var | Default | What it does |
-|---|---|---|
-| `CONFLUENCE_SITE` | `https://wiki-tucows.atlassian.net` | Atlassian instance URL |
-| `SPACE_KEY` | `OCC` | Which space to ingest |
-| `RAG_BASE` | `http://domains-rag-search.lab-domains-sre.svc.cluster.local:8081` | Where to write |
-| `COLLECTION` | `occ_wiki` | Collection name in rag-search |
-| `CHUNK_TARGET_CHARS` | `2200` | Target chunk size (~500 tokens for bge-m3) |
-| `CHUNK_MIN_CHARS` | `300` | Tiny chunks are merged back into neighbors |
+Every aspect of the ingester is env-var driven. Override these in
+`cronjob.yaml` and re-apply when you need different values.
 
-Override in `cronjob.yaml` and re-apply if you need different values.
+| Env var | Required | What it does |
+|---|---|---|
+| `CONFLUENCE_SITE` | yes | Atlassian instance URL (e.g. `https://yourorg.atlassian.net`) |
+| `SPACE_KEY` | yes | Which Confluence space to ingest (the short key, not the display name) |
+| `RAG_BASE` | yes | rag-search base URL (typically the in-cluster ClusterIP) |
+| `COLLECTION` | yes | Collection name in rag-search to write into |
+| `ATLASSIAN_EMAIL` | yes (from secret) | Auth — see "Credentials" above |
+| `ATLASSIAN_API_TOKEN` | yes (from secret) | Auth — see "Credentials" above |
+| `CHUNK_TARGET_CHARS` | optional (default 2200) | Target chunk size (~500 tokens for bge-m3) |
+| `CHUNK_MIN_CHARS` | optional (default 300) | Tiny chunks are merged back into neighbors |
+
+## Deploying a second instance
+
+To ingest a different Confluence space into a different collection,
+copy this bundle and override the names. Minimal changes needed:
+
+1. Copy `deploy/wiki-ingester/` to `deploy/wiki-ingester-<suffix>/`
+2. In the copy's `cronjob.yaml`, rename the resources
+   (`metadata.name: wiki-ingester-<suffix>`), update env vars
+   (`SPACE_KEY`, `COLLECTION`), and change the secret reference name
+   (`wiki-ingester-<suffix>-creds`)
+3. In the copy's `pvc.yaml`, rename to `wiki-ingester-<suffix>-pydeps`
+4. In the copy's `configmap.yaml`, rename to `wiki-ingester-<suffix>-code`
+5. Create the corresponding secret out-of-band
+6. `kubectl apply -k deploy/wiki-ingester-<suffix>/`
+
+The original ingester is unaffected and runs on its own schedule.
 
 ## "Failed" status that isn't really a failure
 
 The job exits 1 if **any** page fails to upsert. A single transient
 502 from rag-search during a long run causes the whole job to be
-marked Failed. Always verify the actual data before treating Failed as
-an outage:
+marked Failed even when most pages landed successfully. Always verify
+the actual data before treating Failed as an outage:
 
 ```bash
 kubectl -n lab-domains-sre exec deploy/pgvector -- \
-  psql -U rag -d rag -c "SELECT COUNT(*) FROM rag_occ_wiki;"
+  psql -U rag -d rag -c "SELECT COUNT(*) FROM rag_<your_collection>;"
 ```
 
 If the count looks right, re-trigger manually and the missed pages

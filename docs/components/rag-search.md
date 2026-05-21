@@ -77,18 +77,22 @@ prevent SQL injection through the path parameter. (The service does
 this validation in Python before any SQL is built — see the
 `_COLLECTION_RE` regex in the source.)
 
-By convention, prefix names with the owner team: `sre_runbooks`,
-`occ_wiki`, `team_x_docs`. There is no enforcement.
+By convention, prefix names with the owning team or app
+(`yourteam_kb`, `yourapp_docs`). Collisions are unlikely with a
+descriptive prefix and there is no enforcement.
 
-## Live collections today
+## Discovering what's live
 
-| Collection | Owner | Source | Rows |
-|---|---|---|---|
-| `sre_runbooks` | UIP `runbook-api` | SQLite `runbook_entries` table; UIP backfill script + live upserts on POST | ~44 chunks |
-| `occ_wiki` | `wiki-ingester` CronJob | Confluence OCC space, daily refresh | ~241 chunks across 23 pages |
+The service does not have a global "list collections" endpoint, so
+discovery is via PostgreSQL directly:
 
-Query `GET /v1/collections/{name}/count` to see the current count for
-any collection.
+```bash
+kubectl -n lab-domains-sre exec deploy/pgvector -- \
+  psql -U rag -d rag -c "\dt rag_*"
+```
+
+That lists every collection table. Use
+`GET /v1/collections/{name}/count` to see row counts per collection.
 
 ## Embedding dimension
 

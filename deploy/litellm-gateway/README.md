@@ -2,8 +2,8 @@
 
 Single OpenAI-compatible front door for the cluster's reasoning models.
 Routes by `model` name to the right vLLM backend, load-balances the 32B
-HA pair, and gives us per-request logging — the audit trail an SRE
-assistant needs when its answers will inform real actions.
+HA pair, and gives us per-request logging — useful as an audit trail
+for any caller that needs to retrace what was sent and what came back.
 
 ## Exposed model names
 
@@ -35,20 +35,20 @@ Switch `model` to `qwen3-235b-thinking` for deep reasoning, or set
 
 ## Apply
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' apply -k 'C:\Users\fash\Desktop\AI Nodes\deploy\litellm-gateway'
+```bash
+kubectl apply -k deploy/litellm-gateway
 ```
 
 ## Scale up (after at least one backend is Ready)
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' -n lab-domains-sre scale deploy/litellm-gateway --replicas=1
+```bash
+kubectl -n lab-domains-sre scale deploy/litellm-gateway --replicas=1
 ```
 
 ## Update routes
 
 Edit `configmap.yaml`, `apply -k`, then bounce the gateway:
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' -n lab-domains-sre rollout restart deploy/litellm-gateway
+```bash
+kubectl -n lab-domains-sre rollout restart deploy/litellm-gateway
 ```

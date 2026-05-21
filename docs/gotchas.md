@@ -130,11 +130,12 @@ When creating a token at
 make sure the scopes include Confluence read access. The "classic"
 unscoped token format has all the user's permissions automatically.
 
-## Atlassian email differs by product
+## Atlassian email can differ by product
 
-User `fash@tucowsinc.com` may exist in Jira; the same person in
-Confluence is `fash@tucows.com`. The Atlassian Basic Auth pair is
-`email:token` — using the wrong email gives a 403, not a 401.
+The same person may have different login emails across Atlassian
+products in some org setups (e.g. one address in Jira, another in
+Confluence). The Atlassian Basic Auth pair is `email:token` — using
+the wrong email gives a 403, not a 401.
 
 When the API returns "caller cannot access Confluence" with what looks
 like a valid token, try alternate email aliases for the same user
@@ -186,7 +187,7 @@ When the job is Failed, before assuming the worst:
 ```bash
 # Did data make it in?
 kubectl -n lab-domains-sre exec deploy/pgvector -- \
-  psql -U rag -d rag -c "SELECT COUNT(*) FROM rag_occ_wiki;"
+  psql -U rag -d rag -c "SELECT COUNT(*) FROM rag_<your_collection>;"
 ```
 
 If the count looks right, the job did its job — just re-trigger

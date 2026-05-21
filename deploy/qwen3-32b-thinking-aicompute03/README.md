@@ -9,12 +9,12 @@ Fast tier reasoning replica B. Pair of `qwen3-32b-thinking-aicompute02`.
 
 ## Apply
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' apply -k 'C:\Users\fash\Desktop\AI Nodes\deploy\qwen3-32b-thinking-aicompute03'
+```bash
+kubectl apply -k deploy/qwen3-32b-thinking-aicompute03
 ```
 
 ## Scale up
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' -n lab-domains-sre scale deploy/qwen3-32b-thinking-aicompute03 --replicas=1
+```bash
+kubectl -n lab-domains-sre scale deploy/qwen3-32b-thinking-aicompute03 --replicas=1
 ```

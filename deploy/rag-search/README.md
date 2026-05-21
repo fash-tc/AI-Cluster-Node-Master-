@@ -21,21 +21,22 @@ table `rag_<name>` in the shared `rag` PostgreSQL database.
 
 ## Endpoint URLs
 
-- External (UIP host, etc.): `http://aicompute01.cnco1.tucows.cloud:31445`
+- External: `http://aicompute01.cnco1.tucows.cloud:31445`
 - In-cluster: `http://domains-rag-search.lab-domains-sre.svc.cluster.local:8081`
 
 ## Multi-tenant pattern
 
-Each consumer owns a collection name:
+Each consumer owns a collection name. Examples of how teams might pick
+names:
 
-| Collection | Owner | Purpose |
-|---|---|---|
-| `sre_runbooks` | UIP runbook-api | Alert remediation notes |
-| `team_x_docs` | (future) | Other team's knowledgebase |
+| Collection (example) | Purpose |
+|---|---|
+| `yourteam_kb` | Your team's general knowledge base |
+| `yourapp_docs` | Documentation for a specific app |
+| `project_runbooks` | Project-scoped operational notes |
 
 Collections share the embedding model and pgvector instance but have isolated
-tables. Searches against `sre_runbooks` cannot accidentally surface rows from
-`team_x_docs`.
+tables. Searches against one collection cannot surface rows from another.
 
 For stronger isolation, add a per-team PostgreSQL role + schema (the secret
 in this bundle uses the shared `rag` user — fine while consumers are trusted,
@@ -49,14 +50,14 @@ hardcoded. If you swap to a different embedding model later, both
 
 ## Apply paused
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' apply -k 'C:\Users\fash\Desktop\AI Nodes\deploy\rag-search'
+```bash
+kubectl apply -k deploy/rag-search
 ```
 
 ## Scale up
 
-```powershell
-& 'C:\Users\fash\Desktop\AI Nodes\tools\kubectl.exe' --kubeconfig 'C:\Users\fash\Desktop\AI Nodes\kubeconfig-prod-ai-k8-windows' -n lab-domains-sre scale deploy/rag-search --replicas=1
+```bash
+kubectl -n lab-domains-sre scale deploy/rag-search --replicas=1
 ```
 
 First start installs `psycopg[binary]==3.2.3` into a 1 GiB PVC. Subsequent
@@ -66,15 +67,15 @@ restarts skip the install and come up in seconds.
 
 ```bash
 # Init a collection
-curl -X POST http://aicompute01.cnco1.tucows.cloud:31445/v1/collections/sre_runbooks/init
+curl -X POST http://aicompute01.cnco1.tucows.cloud:31445/v1/collections/test_kb/init
 
 # Upsert one entry
-curl -X POST http://aicompute01.cnco1.tucows.cloud:31445/v1/collections/sre_runbooks/upsert \
+curl -X POST http://aicompute01.cnco1.tucows.cloud:31445/v1/collections/test_kb/upsert \
   -H "Content-Type: application/json" \
-  -d '{"id": 1, "text": "When checkout-api 5xx spikes, check redis hit rate first then postgres slow log.", "metadata": {"service": "checkout-api", "severity": "high"}}'
+  -d '{"id": 1, "text": "The capital of France is Paris.", "metadata": {"category": "geography"}}'
 
 # Search
-curl -X POST http://aicompute01.cnco1.tucows.cloud:31445/v1/collections/sre_runbooks/search \
+curl -X POST http://aicompute01.cnco1.tucows.cloud:31445/v1/collections/test_kb/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "checkout latency", "top_k": 5}'
+  -d '{"query": "what is the French capital", "top_k": 5}'
 ```
